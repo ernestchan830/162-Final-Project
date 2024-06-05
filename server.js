@@ -1,3 +1,5 @@
+const { google } = require('googleapis');
+const { OAuth2Client } = require('google-auth-library');
 const express = require('express');
 const expressHandlebars = require('express-handlebars');
 const session = require('express-session');
@@ -8,6 +10,12 @@ const sqlite3 = require('sqlite3');
 const dbFileName = 'your_database_file.db';
 let db;
 
+const passport = require('passport');
+const GoogleStrategy = require('passport-google-oauth20').Strategy;
+const dotenv = require('dotenv');
+
+dotenv.config();
+
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 // Configuration and Setup
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -15,6 +23,80 @@ let db;
 const accessToken = process.env.EMOJI_API_KEY;
 const app = express();
 const PORT = 3000;
+const path = require('path');
+
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const REDIRECT_URI = 'http://localhost:3000/auth/google/callback';
+const client = new OAuth2Client(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
+
+app.use(
+    session({
+        secret: 'oneringtorulethemall',
+        resave: false,
+        saveUninitialized: false,
+        cookie: { secure: false },
+    })
+);
+
+
+app.get('/auth/google', (req, res) => {
+    const url = client.generateAuthUrl({
+        access_type: 'offline',
+        scope: ['https://www.googleapis.com/auth/userinfo.email', 'https://www.googleapis.com/auth/userinfo.profile'],
+    });
+    res.redirect(url);
+});
+
+
+app.get('/auth/google/callback', async (req, res) => {
+    const { code } = req.query;
+    const { tokens } = await client.getToken(code);
+    client.setCredentials(tokens);
+
+    const oauth2 = google.oauth2({
+        auth: client,
+        version: 'v2',
+    });
+
+    const userinfo = await oauth2.userinfo.get();
+    const googleId = userinfo.data.id; // Get Google ID
+    const hashGoogleId = hashCode(googleId);
+    
+    // Check if the Google ID is already associated with a user in your database
+    console.log("before finduserbygoogleid call");
+    const existingUser = await findUserByGoogleId(hashGoogleId);
+    console.log(existingUser.hashedGoogleId, "EXISTINGUSER");
+    if (existingUser) {
+        // User already exists, set user ID in session
+        console.log("inside existing user")
+        req.session.userId = existingUser.hashedGoogleId;
+        req.session.loggedIn = true;
+        res.redirect('/profile');
+        console.log("out existing user");
+    } else {
+        // User doesn't exist, redirect to register
+        res.redirect('/register');
+    }
+});
+
+
+passport.use(new GoogleStrategy({
+    clientID: CLIENT_ID,
+    clientSecret: CLIENT_SECRET,
+    callbackURL: `http://localhost:${PORT}/auth/google/callback`
+}, (token, tokenSecret, profile, done) => {
+    return done(null, profile);
+}));
+
+passport.serializeUser((user, done) => {
+    done(null, user);
+});
+
+passport.deserializeUser((obj, done) => {
+    done(null, obj);
+});
+
 
 /*
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -44,6 +126,8 @@ const PORT = 3000;
 
 // Set up Handlebars view engine with custom helpers
 //
+
+
 app.engine(
     'handlebars',
     expressHandlebars.engine({
@@ -143,6 +227,7 @@ app.post('/like/:id', async (req, res) => {
     await updatePostLikes(req, res);
 });
 app.get('/profile', isAuthenticated, async (req, res) => {
+    console.log("before the render profile call");
     await renderProfile(req, res);
 });
 app.get('/avatar/:username', (req, res) => {
@@ -190,24 +275,41 @@ async function findUserByUsername(username) {
 
 // Function to find a user by user ID
 async function findUserById(userId) {
-    const userIdFromDB = await db.get(`SELECT * FROM users WHERE id = '${userId}'`);
+    console.log("before finduserbyid call",userId);
+    // const userIdFromDB = await db.get(`SELECT * FROM users WHERE hashedGoogleId = '${userId}'`);
+    const userIdFromDB = await db.get('SELECT * FROM users WHERE hashedGoogleId = ?', [userId]);
+    console.log("finduserid db value",userIdFromDB,userId);
     if (userIdFromDB) {
         return userIdFromDB;
     }
     return undefined;
 }
 
+// Function to find a user by Google ID
+async function findUserByGoogleId(hashGoogleId) {
+    console.log("insdie the finduserbygoogleid");
+    const user = await db.get('SELECT * FROM users WHERE hashedGoogleId = ?', [hashGoogleId]);
+    console.log(user, " HIII");
+    console.log("^^^");
+    return user;
+}
+
 // Function to add a new user
 async function addUser(username) {
-    // comment this out after partner sends me OAUTH code
-    const googleId = Math.floor(1000000 * Math.random());
-    const hashGoogleId = `hashGoogleId${googleId}`;
-    // To-do: hashGoogleId
-    // hashGoogleId = hashCode(...);
+    const oauth2 = google.oauth2({
+        auth:client,
+        version:'v2',
+    });
+    const userinfo =await oauth2.userinfo.get();
+    const googleId=userinfo.data.id;
+    
+    const hashGoogleId = hashCode(googleId);
+
     await db.run(
         'INSERT INTO users (username, hashedGoogleId, avatar_url, memberSince) VALUES (?, ?, ?, ?)',
         [username, hashGoogleId, undefined, getCurTime()]
     );
+
 }
 
 // Middleware to check if user is authenticated
@@ -227,7 +329,10 @@ async function registerUser(req, res) {
         res.redirect('/register?error=Username+already+exists');
     } else {
         await addUser(username);
-        res.redirect('/login');
+        const newUser = findUserByUsername(username);
+        req.session.userId = newUser.id;
+        req.session.loggedIn = true;
+        res.redirect('/');
     }
 }
 
@@ -239,7 +344,7 @@ async function loginUser(req, res) {
     if (user) {
         req.session.userId = user.id;
         req.session.loggedIn = true;
-        res.redirect('/');
+        res.redirect('/profile');
     } else {
         res.redirect('/login?error=Invalid+username');
     }
@@ -260,8 +365,13 @@ function logoutUser(req, res) {
 // Function to render the profile page
 async function renderProfile(req, res) {
     const user = await getCurrentUser(req) || {};
-    const userPosts = await db.all(`SELECT * FROM posts WHERE username = ${user.username}`);
+    console.log("inside render profile call",user, user.username);
+    // const userPosts = await db.all(`SELECT * FROM posts WHERE username = ${user.username}`);
+    const userPosts = await db.all('SELECT * FROM posts WHERE username = ?', [user.username]);
+
+    console.log("outside render db call");
     res.render('profile', {userPosts, user});
+    console.log("outside render profile call");
 }
 
 // Function to update post likes
@@ -285,6 +395,7 @@ function handleAvatar(req, res) {
 
 // Function to get the current user from session
 async function getCurrentUser(req) {
+    // console.log("what is the session:", req.session);
     return await findUserById(req.session.userId);
 }
 
@@ -373,6 +484,7 @@ function generateAvatar(letter, width = 100, height = 100) {
     const y = height / 2;
 
     // Draw the letter in the center
+    // console.log(upperCaseLetter);
     ctx.fillText(upperCaseLetter, x, y);
 
     // Return the avatar as a PNG buffer
